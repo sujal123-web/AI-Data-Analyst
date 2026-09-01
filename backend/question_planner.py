@@ -1410,6 +1410,157 @@ def _is_likely_sales_column(column_name):
 
 # ============================================================
 # FAST QUESTION PLANNER
+
+# ============================================================
+# QUESTION-AWARE GROUP COLUMN RESOLUTION
+# ============================================================
+
+def _find_question_group_column(question, profile):
+    """
+    Resolve the grouping dimension explicitly mentioned in the
+    user's question.
+
+    The old fast planner selected one generic categorical column
+    before looking at the question. For example, a dataset with
+    COUNTRY and PRODUCTLINE could incorrectly use COUNTRY for:
+        "What are the total sales by product line?"
+
+    This helper makes the grouping dimension depend on the
+    wording of the actual question.
+    """
+
+    if not question:
+        return None
+
+    q = str(question).lower().strip()
+
+    semantic_aliases = [
+        (
+            ["product line", "productline", "product lines", "productlines"],
+            ["PRODUCTLINE", "ProductLine", "product_line", "product line"],
+        ),
+        (
+            ["deal size", "dealsize", "deal sizes"],
+            ["DEALSIZE", "DealSize", "deal_size", "deal size"],
+        ),
+        (
+            ["order date", "orderdate"],
+            ["ORDERDATE", "OrderDate", "order_date"],
+        ),
+        (
+            ["country", "countries", "nation"],
+            ["COUNTRY", "Country", "country"],
+        ),
+        (
+            ["region", "regions"],
+            ["REGION", "Region", "region"],
+        ),
+        (
+            ["market", "markets"],
+            ["MARKET", "Market", "market"],
+        ),
+        (
+            ["category", "categories"],
+            ["CATEGORY", "Category", "category"],
+        ),
+        (
+            ["product", "products"],
+            ["PRODUCT", "Product", "product"],
+        ),
+        (
+            ["department", "departments"],
+            ["DEPARTMENT", "Department", "department"],
+        ),
+        (
+            ["segment", "segments"],
+            ["SEGMENT", "Segment", "segment"],
+        ),
+        (
+            ["customer", "customers"],
+            ["CUSTOMER", "Customer", "customer"],
+        ),
+        (
+            ["status"],
+            ["STATUS", "Status", "status"],
+        ),
+        (
+            ["city", "cities"],
+            ["CITY", "City", "city"],
+        ),
+        (
+            ["state", "states"],
+            ["STATE", "State", "state"],
+        ),
+    ]
+
+    # Specific phrases are checked before broader phrases.
+    for phrases, candidates in semantic_aliases:
+
+        if any(phrase in q for phrase in phrases):
+
+            resolved = _find_exact_column(
+                profile,
+                candidates
+            )
+
+            if resolved:
+                return resolved
+
+            resolved = _find_categorical_column(
+                profile,
+                candidates
+            )
+
+            if resolved:
+                return resolved
+
+    # Generic fallback: use an exact normalized dataset column
+    # mentioned in the question.
+    normalized_question = _normalize_column_name(q)
+
+    columns = profile.get(
+        "column_details",
+        {}
+    )
+
+    candidates = []
+
+    for column, details in columns.items():
+
+        if details.get("category") not in [
+            "categorical",
+            "geographic",
+            "temporal",
+        ]:
+            continue
+
+        normalized_column = _normalize_column_name(column)
+
+        if not normalized_column:
+            continue
+
+        if normalized_column in normalized_question:
+
+            # Prefer longer matches so PRODUCTLINE wins over PRODUCT.
+            candidates.append(
+                (
+                    len(normalized_column),
+                    column
+                )
+            )
+
+    if candidates:
+
+        candidates.sort(
+            key=lambda item: item[0],
+            reverse=True
+        )
+
+        return candidates[0][1]
+
+    return None
+
+
 # ============================================================
 
 def fast_plan_question(question, profile):
@@ -1500,40 +1651,47 @@ def fast_plan_question(question, profile):
     )
 
     # ========================================================
-    # COMMON GROUP/CATEGORY COLUMN
+    # QUESTION-AWARE GROUP/CATEGORY COLUMN
     # ========================================================
 
-    group_column = _find_categorical_column(
-        profile,
-        [
-            "country",
-            "region",
-            "market",
-            "category",
-            "product",
-            "productline",
-            "department",
-            "segment",
-            "customer",
-        ]
+    # Resolve the grouping dimension from the actual question.
+    # Do not choose one generic categorical column for every query.
+    group_column = _find_question_group_column(
+        q,
+        profile
     )
 
     # --------------------------------------------------------
     # TOTAL
     # --------------------------------------------------------
 
-    if sales_column and any(
-        phrase in q
-        for phrase in [
-            "total sales",
-            "total revenue",
-            "overall sales",
-            "overall revenue",
-            "sales in total",
-            "revenue in total",
-            "how much did we make",
-            "how much money did we make",
-        ]
+    is_grouped_request = (
+        sales_column
+        and group_column
+        and (
+            " by " in f" {q} "
+            or " for each " in f" {q} "
+            or " per " in f" {q} "
+            or "wise" in q
+        )
+    )
+
+    if (
+        sales_column
+        and not is_grouped_request
+        and any(
+            phrase in q
+            for phrase in [
+                "total sales",
+                "total revenue",
+                "overall sales",
+                "overall revenue",
+                "sales in total",
+                "revenue in total",
+                "how much did we make",
+                "how much money did we make",
+            ]
+        )
     ):
 
         return {
@@ -1545,16 +1703,27 @@ def fast_plan_question(question, profile):
     # AVERAGE
     # --------------------------------------------------------
 
-    if sales_column and any(
-        phrase in q
-        for phrase in [
-            "average sales",
-            "average sale",
-            "mean sales",
-            "mean sale",
-            "average revenue",
-            "mean revenue",
-        ]
+    if (
+        sales_column
+        and not (
+            group_column
+            and (
+                " by " in f" {q} "
+                or " for each " in f" {q} "
+                or " per " in f" {q} "
+            )
+        )
+        and any(
+            phrase in q
+            for phrase in [
+                "average sales",
+                "average sale",
+                "mean sales",
+                "mean sale",
+                "average revenue",
+                "mean revenue",
+            ]
+        )
     ):
 
         return {
@@ -1742,29 +1911,70 @@ def fast_plan_question(question, profile):
             "sales by country",
             "sales by product",
             "sales by productline",
+            "sales by product line",
             "sales by department",
             "sales by segment",
+            "sales by deal size",
+            "sales by status",
             "sales for each region",
             "sales for each market",
             "sales for each category",
             "sales for each country",
             "sales for each product",
+            "sales for each product line",
+            "sales for each deal size",
+            "total sales by region",
+            "total sales by market",
+            "total sales by category",
+            "total sales by country",
+            "total sales by product",
+            "total sales by productline",
+            "total sales by product line",
+            "total sales by department",
+            "total sales by segment",
+            "total sales by deal size",
+            "total sales by status",
+            "total revenue by region",
+            "total revenue by market",
+            "total revenue by category",
+            "total revenue by country",
+            "total revenue by product",
+            "total revenue by productline",
+            "total revenue by product line",
+            "total revenue by department",
+            "total revenue by segment",
+            "total revenue by deal size",
+            "total revenue by status",
+            "revenue by region",
+            "revenue by market",
+            "revenue by category",
+            "revenue by country",
+            "revenue by product",
+            "revenue by productline",
+            "revenue by product line",
+            "revenue by department",
+            "revenue by segment",
+            "revenue by deal size",
+            "revenue by status",
         ]
     ):
 
-        group_column = _find_categorical_column(
-            profile,
-            [
-                "region",
-                "market",
-                "category",
-                "country",
-                "product",
-                "productline",
-                "department",
-                "segment",
-            ]
-        )
+        # group_column was already resolved from the question.
+        # Keep a generic fallback for unusual wording.
+        if not group_column:
+            group_column = _find_categorical_column(
+                profile,
+                [
+                    "region",
+                    "market",
+                    "category",
+                    "country",
+                    "product",
+                    "productline",
+                    "department",
+                    "segment",
+                ]
+            )
 
         if group_column:
 
@@ -1995,6 +2205,9 @@ missing_count
 
 group_sum
 - Use when asking for totals/sums by category.
+- "total sales by X", "total revenue by X", and
+  "sales for each X" are GROUPED requests, not a
+  dataset-level total.
 - Also use when asking which category/region/market
   performed best when "performance" refers to total
   sales or revenue.
@@ -2046,6 +2259,12 @@ unsupported
 
 
 IMPORTANT SEMANTIC RULES:
+
+0. GROUPING TAKES PRECEDENCE:
+   - "total sales by product line" -> group_sum
+   - "total sales by country" -> group_sum
+   - "total revenue by region" -> group_sum
+   - Never interpret "total sales by X" as a dataset-level total.
 
 1. "largest sales value"
    -> maximum
